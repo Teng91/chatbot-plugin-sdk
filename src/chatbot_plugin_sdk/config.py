@@ -16,12 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 class ChatbotSettings(BaseSettings):
     """Toolbox settings."""
 
-    # Vector dimensions (must match embedding model output)
-    embedding_dimension: int = 1024
-    sparse_dimension: int = 250002
+    # Vector dimension (Gemini dense only, 768-dim)
+    embedding_dimension: int = 768
 
-    # Search / RRF
-    rrf_k: int = 60
+    # Search
+    search_candidates: int = 50
+    max_context_chunks: int = 10
+
+    # No sparse search — Gemini only produces dense vectors
     search_candidates: int = 50
     max_context_chunks: int = 10
 

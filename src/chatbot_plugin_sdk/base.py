@@ -2,14 +2,16 @@
 
 This is the base class for all toolbox SDK variants.
 It manages database configuration and provides common operations:
-- Hybrid dense + sparse search with RRF fusion
+- Dense cosine search via pgvector
 - Chat with RAG context (retrieval + LLM generation)
 - LLM fallback chain (Anthropic → Gemini → raw context)
+
+Note: Only dense vectors (768-dim) are used. Sparse/lexical search
+was removed because Gemini does not produce sparse vectors.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any, TYPE_CHECKING
 from uuid import UUID
 
@@ -63,13 +65,7 @@ class BaseRagProcessor:
         host: str = "localhost",
         port: int = 5432,
     ) -> DatabaseConfig:
-        """Build an async SQLAlchemy engine and session factory.
-
-        Returns a :class:`DatabaseConfig` containing ``engine`` and
-        ``session_factory``.  Tables are **not** created here — that
-        happens lazily via :meth:`_ensure_tables` with proper async
-        context.
-        """
+        """Build an async SQLAlchemy engine and session factory."""
         database_url = (
             f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
         )
@@ -83,32 +79,19 @@ class BaseRagProcessor:
         return self._db_config
 
     def _configure_embedding_model(self, api_url: str, api_key: str | None = None) -> EmbeddingModelConfig:
-        """Configure the HTTP embedding model endpoint.
-
-        Args:
-            api_url: Base URL of the embedding microservice (e.g. ``http://localhost:8080``).
-            api_key: Optional API key forwarded as *Authorization: Bearer <token>*.
-
-        Returns:
-            An :class:`EmbeddingModelConfig` instance.
-        """
+        """Configure the HTTP embedding model endpoint."""
         self._embed_config = EmbeddingModelConfig(base_url=api_url, api_key=api_key)
         return self._embed_config
 
     async def _ensure_tables(self) -> None:
-        """Create DB extensions and tables if they don't exist yet.
-
-        Safe to call multiple times — guarded by ``_tables_created``.
-        """
+        """Create DB extensions and tables if they don't exist yet."""
         if self._tables_created or self._db_config is None:
             return
 
         from chatbot_plugin_sdk.models import Base
 
         async with self._db_config.engine.begin() as conn:
-            # pgvector extension
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS sparsevec"))
             await conn.run_sync(Base.metadata.create_all)
         self._tables_created = True
 
@@ -121,11 +104,10 @@ class BaseRagProcessor:
 
     # ── Embedding support ──
 
-    async def _embed_query(self, query: str) -> tuple[list[float], dict[int, float]]:
+    async def _embed_query(self, query: str) -> list[float]:
         """Embed a query string via the configured HTTP embedding service.
 
-        POSTs ``{"texts": [query]}`` to the embedding service and
-        expects ``{"dense": [[...]], "sparse": [{...}]}``.
+        Returns a single 768-dimensional dense vector.
         """
         if self._embed_config is None:
             raise NotConfiguredError(
@@ -143,18 +125,15 @@ class BaseRagProcessor:
                 raise EmbeddingError(f"Embedding request failed: {exc}") from exc
 
         dense = data.get("dense", [])
-        sparse_raw = data.get("sparse", [])
-        if not dense or not sparse_raw:
-            raise EmbeddingError("Embedding response missing dense or sparse vectors")
+        if not dense:
+            raise EmbeddingError("Embedding response missing dense vectors")
 
-        sparse_vec: dict[int, float] = {int(k): float(v) for k, v in sparse_raw[0].items()}
-        return dense[0], sparse_vec
+        return dense[0]
 
-    async def _embed_texts(self, texts: list[str]) -> tuple[list[list[float]], list[dict[int, float]]]:
+    async def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts via the configured HTTP embedding service.
 
-        POSTs ``{"texts": texts}`` to the embedding service and
-        expects ``{"dense": [...], "sparse": [...]}``.
+        Returns list of 768-dimensional dense vectors.
         """
         if self._embed_config is None:
             raise NotConfiguredError(
@@ -172,34 +151,23 @@ class BaseRagProcessor:
                 raise EmbeddingError(f"Embedding request failed: {exc}") from exc
 
         dense_list: list[list[float]] = data.get("dense", [])
-        sparse_raw_list: list[dict] = data.get("sparse", [])
-        if not dense_list or not sparse_raw_list:
-            raise EmbeddingError("Embedding response missing dense or sparse vectors")
+        if not dense_list:
+            raise EmbeddingError("Embedding response missing dense vectors")
 
-        sparse_list: list[dict[int, float]] = []
-        for raw in sparse_raw_list:
-            sparse_list.append({int(k): float(v) for k, v in raw.items()})
-        return dense_list, sparse_list
+        return dense_list
 
     # ── Search ──
 
     async def search(self, query: str, top_k: int = 10) -> SearchResponse:
-        """Hybrid dense + sparse search with RRF fusion.
+        """Dense cosine similarity search.
 
-        Embeds ``query`` via :meth:`_embed_query`, then queries the
-        database for dense and sparse candidates and fuses rankings.
+        Embeds ``query``, then queries pgvector for the most similar chunks
+        by cosine distance on ``dense_vector``.
         """
-        from pgvector import SparseVector
-
-        dense_vec, sparse_weights = await self._embed_query(query)
-        sparse_vec = SparseVector(sparse_weights, settings.sparse_dimension)
-
-        candidates = settings.search_candidates
-        k = settings.rrf_k
+        dense_vec = await self._embed_query(query)
 
         async with await self._get_session() as db:
-            # Dense candidates
-            dense_stmt = (
+            stmt = (
                 select(
                     ArticleChunk.id.label("chunk_id"),
                     ArticleChunk.article_id,
@@ -211,63 +179,22 @@ class BaseRagProcessor:
                 .join(Article, ArticleChunk.article_id == Article.id)
                 .where(ArticleChunk.dense_vector.isnot(None))
                 .order_by(ArticleChunk.dense_vector.cosine_distance(dense_vec))
-                .limit(candidates)
+                .limit(top_k)
             )
-            dense_result = await db.execute(dense_stmt)
-            dense_rows = dense_result.all()
-
-            # Sparse candidates
-            sparse_stmt = (
-                select(
-                    ArticleChunk.id.label("chunk_id"),
-                    ArticleChunk.article_id,
-                    ArticleChunk.chunk_index,
-                    ArticleChunk.content,
-                    Article.title,
-                    Article.url,
-                )
-                .join(Article, ArticleChunk.article_id == Article.id)
-                .where(ArticleChunk.sparse_vector.isnot(None))
-                .order_by(ArticleChunk.sparse_vector.max_inner_product(sparse_vec))
-                .limit(candidates)
-            )
-            sparse_result = await db.execute(sparse_stmt)
-            sparse_rows = sparse_result.all()
-
-        # RRF fusion
-        chunk_scores: dict[str, tuple[float, Any]] = {}
-
-        for rank, row in enumerate(dense_rows, start=1):
-            chunk_id = str(row.chunk_id)
-            chunk_scores[chunk_id] = (1.0 / (k + rank), row)
-
-        for rank, row in enumerate(sparse_rows, start=1):
-            chunk_id = str(row.chunk_id)
-            if chunk_id in chunk_scores:
-                chunk_scores[chunk_id] = (
-                    chunk_scores[chunk_id][0] + 1.0 / (k + rank),
-                    chunk_scores[chunk_id][1],
-                )
-            else:
-                chunk_scores[chunk_id] = (1.0 / (k + rank), row)
-
-        sorted_chunks = sorted(
-            chunk_scores.items(),
-            key=lambda x: x[1][0],
-            reverse=True,
-        )[:top_k]
+            result = await db.execute(stmt)
+            rows = result.all()
 
         chunks = [
             ChunkResult(
-                chunk_id=chunk_id,
+                chunk_id=str(row.chunk_id),
                 article_id=str(row.article_id),
                 article_title=row.title,
                 article_url=row.url,
                 chunk_index=row.chunk_index,
                 content=row.content,
-                score=round(score, 6),
+                score=0.0,  # cosine_distance does not give a score directly
             )
-            for chunk_id, (score, row) in sorted_chunks
+            for row in rows
         ]
 
         return SearchResponse(chunks=chunks)
@@ -406,18 +333,7 @@ class BaseRagProcessor:
 
         This is the internal persistence method shared by both the
         ``/tools/chunks`` endpoint and :meth:`RagArticleProcessor.ingest`.
-
-        Args:
-            article_id: Article UUID.
-            metadata: Article metadata dict with ``url``, ``title``, ``source``, etc.
-            chunks_data: List of chunk dicts with ``chunk_index``, ``content``,
-                ``dense_vector``, and optional ``sparse_vector``.
-
-        Returns:
-            A :class:`StoreChunksResponse` with ``stored`` count and ``article_id``.
         """
-        from pgvector import SparseVector
-
         expected_dim = settings.embedding_dimension
         for chunk in chunks_data:
             if len(chunk["dense_vector"]) != expected_dim:
@@ -459,16 +375,11 @@ class BaseRagProcessor:
 
                 # Insert new chunks
                 for chunk in chunks_data:
-                    sparse = None
-                    if chunk.get("sparse_vector"):
-                        sparse = SparseVector(chunk["sparse_vector"], settings.sparse_dimension)
-
                     article_chunk = ArticleChunk(
                         article_id=article_id,
                         chunk_index=chunk["chunk_index"],
                         content=chunk["content"],
                         dense_vector=chunk["dense_vector"],
-                        sparse_vector=sparse,
                     )
                     session.add(article_chunk)
 

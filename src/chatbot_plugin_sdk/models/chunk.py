@@ -1,15 +1,13 @@
 """Chunk model — stores pre-chunked, pre-embedded article data.
 
-Each chunk belongs to an Article and holds a dense vector (pgvector)
-and optional sparse vector (sparsevec lexical weights).
+Only dense vectors (768-dim) — Gemini does not produce sparse.
 """
 
-from sqlalchemy import Column, ForeignKey, Integer, Text, DateTime, UniqueConstraint, func, Index
+from sqlalchemy import Column, ForeignKey, Integer, Text, DateTime, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from pgvector.sqlalchemy import Vector
-from pgvector.sqlalchemy.sparsevec import SPARSEVEC
 
 from chatbot_plugin_sdk.config import settings
 from chatbot_plugin_sdk.models.article import Base
@@ -30,22 +28,16 @@ class ArticleChunk(Base):
         Vector(settings.embedding_dimension),
         nullable=True,
     )
-    sparse_vector = Column(
-        SPARSEVEC(settings.sparse_dimension),
-        nullable=True,
-    )
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
     )
 
-    # String reference avoids any import-order issues
     article = relationship("Article", back_populates="chunks")
 
     __table_args__ = (
         UniqueConstraint("article_id", "chunk_index", name="uq_article_chunk_idx"),
-        Index("idx_chunks_sparse", "sparse_vector"),
     )
 
     def __repr__(self) -> str:
